@@ -1,0 +1,1053 @@
+import ctypes
+import os
+import re
+from tkinter import ttk
+from datetime import datetime
+import threading
+import PyPDF2
+import chardet
+import openpyxl
+from PIL.ImageTk import PhotoImage
+from PIL import Image, ImageTk
+from pystray import Icon, MenuItem, Menu
+import sys
+import tkinter as tk
+from tkinter import filedialog
+import wmi
+from tkinter import messagebox
+
+"""
+无u盘id识别
+
+"""
+
+
+def get_usb_devices():
+    """
+    获取当前连接的所有 U 盘信息。
+    """
+    c = wmi.WMI()
+    usb_devices = []
+    for disk in c.Win32_DiskDrive():
+        if "Removable" in disk.MediaType:  # 只检查可移动存储设备
+            usb_devices.append({
+                "DeviceID": disk.DeviceID,
+                "PNPDeviceID": disk.PNPDeviceID,
+                "Model": disk.Model
+            })
+    return usb_devices
+
+# 获取 U 盘信息
+usb_devices = get_usb_devices()
+for device in usb_devices:
+    print(f"设备名称: {device['DeviceID']}")
+    print(f"PNP 设备 ID: {device['PNPDeviceID']}")
+    print(f"型号: {device['Model']}")
+
+
+def write_summary(out, scan_type, stats):
+    out.write('#结果摘要-----------------------------------------------------------\n')
+
+    if scan_type == 'keyword':
+        out.write(f'总计命中{stats["total_keyword_hits"]}个敏感文字\n')
+        if stats["total_keyword_hits"] > 0:
+            # 格式化输出为 <敏感文字, 次数>
+            keyword_list = [f'<{key}，{count}>' for key, count in stats["keyword_hits"].items() if count > 0]
+            out.write(f'命中敏感文字列表：{"：".join(keyword_list)}\n')
+        else:
+            out.write('未发现任何命中的敏感文字。\n')
+
+    elif scan_type == 'id':
+        out.write(f'总计命中{stats["total_id_count"]}个身份证号\n')
+        if stats["matched_ids"]:
+            # 统计身份证号及出现次数（从列表转换为字典）
+            id_counts = {}
+            for id_ in stats["matched_ids"]:
+                id_counts[id_] = id_counts.get(id_, 0) + 1
+
+            # 格式化输出为 <值, 次数>
+            id_list = [f'<{id_}，{count}>' for id_, count in id_counts.items()]
+            out.write(f'命中身份证号列表：{"：".join(id_list)}\n')
+        else:
+            out.write('未发现任何命中的身份证号。\n')
+
+    elif scan_type == 'phone':
+        out.write(f'总计命中{stats["total_phone_count"]}个手机号\n')
+        if stats["matched_phones"]:
+            # 统计手机号及出现次数（从列表转换为字典）
+            phone_counts = {}
+            for phone in stats["matched_phones"]:
+                phone_counts[phone] = phone_counts.get(phone, 0) + 1
+
+            # 格式化输出为 <值, 次数>
+            phone_list = [f'<{phone}，{count}>' for phone, count in phone_counts.items()]
+            out.write(f'命中手机号列表：{"：".join(phone_list)}\n')
+        else:
+            out.write('未发现任何命中的手机号。\n')
+
+
+# 用于获取资源文件的绝对路径
+def resource_path(relative_path):
+    """ 获取打包后资源文件的路径，并规范化为反斜杠格式 """
+    if hasattr(sys, '_MEIPASS'):
+        # PyInstaller 打包后会将资源文件放在 _MEIPASS 目录下
+        path = os.path.join(sys._MEIPASS, relative_path)
+    else:
+        path = os.path.join(os.path.abspath(""), relative_path)
+
+    # 使用 os.path.normpath 统一路径为当前系统的格式（在 Windows 上为反斜杠）
+    return os.path.normpath(path)
+
+# 默认的关键字列表
+default_keywords = ['姓名', '手机', '银行', 'email']
+
+# 获取系统中的所有盘符
+def get_drives():
+    drives = []
+    for drive in range(ord('C'), ord('Z') + 1):
+        drive_path = f"{chr(drive)}:\\"
+        if os.path.exists(drive_path):
+            drives.append(drive_path)
+    return drives
+
+# 检查文件是否有读取权限
+def has_read_permission(file_path):
+    try:
+        if not os.path.exists(file_path):
+            print(f"文件 {file_path} 不存在")
+            return False
+        if os.access(file_path, os.R_OK):
+            return True
+        else:
+            print(f"没有读取文件 {file_path} 的权限")
+            return False
+    except Exception as e:
+        print(f"检查文件 {file_path} 权限时发生错误: {e}")
+        return False
+
+# 封装的读取函数，先检查权限
+def try_read_file(file_path, read_function):
+    if has_read_permission(file_path):
+        try:
+            return read_function(file_path)
+        except UnicodeDecodeError as e:
+            print(f"读取文件 {file_path} 时发生编码错误: {e}")
+        except IOError as e:
+            print(f"读取文件 {file_path} 时发生IO错误: {e}")
+        except Exception as e:
+            print(f"读取文件 {file_path} 时发生未知错误: {e}")
+    else:
+        print(f"没有读取 {file_path} 的权限或文件不存在")
+    return None
+
+# 关键字扫描功能：返回命中的关键词列表和每个关键词的命中次数
+def contains(longstr, keywords):
+    hit_keywords = {}
+    total_hits = 0
+    for key in keywords:
+        count = longstr.count(key)  # 统计每个关键词的命中次数
+        if count > 0:
+            hit_keywords[key] = count
+            total_hits += count
+    return hit_keywords, total_hits
+
+
+# 身份证号提取功能
+def idset(text):
+    idset = set()
+    temp = ''
+    for c in text:
+        if c.isdigit() or c == 'x' or c == 'X':
+            temp += c
+        else:
+            # 检查是否是一个完整的身份证号
+            if len(temp) == 18:
+                idset.add(temp)
+            temp = ''
+
+    # 检查最后的身份证号
+    if len(temp) == 18:
+        idset.add(temp)
+
+    return idset
+
+# 手机号提取功能
+head = {'130', '131', '132', '133', '134', '135', '136', '137', '138', '139', '150', '151', '152', '153', '155', '156',
+        '157', '158', '159', '166', '173', '175', '176', '177', '178', '180', '181', '182', '183', '184', '185', '186',
+        '187', '188', '189', '191', '198', '199'}
+
+def phoneset(text):
+    phoneset = set()
+    temp = ''
+    for c in text:
+        if c.isdigit():
+            temp += c
+        else:
+            if len(temp) == 11 and temp[:3] in head:
+                phoneset.add(temp)
+            temp = ''
+    if len(temp) == 11 and temp[:3] in head:
+        phoneset.add(temp)
+    return phoneset
+
+# 抽取 PDF 文件中的文本
+def extract_pdf(file_path):
+    pdf_reader = PyPDF2.PdfReader(open(file_path, 'rb'))
+    text = ''
+    for page in range(len(pdf_reader.pages)):
+        page_text = pdf_reader.pages[page]
+        text += page_text.extract_text()
+    return text.replace('\n', ' ')
+
+# 抽取 Office 文件 (docx, pptx, xlsx)
+from docx import Document
+
+def extract_docx(file_path):
+    doc = Document(file_path)
+    text = ''
+    for para in doc.paragraphs:
+        text += para.text + '\n'
+    return text
+import win32com.client as win32
+# 提取.doc文件的内容（使用win32com）
+def extract_doc(file_path):
+    word = win32.Dispatch("Word.Application")
+    word.Visible = False  # 不显示 Word 窗口
+    doc = word.Documents.Open(file_path)
+    text = doc.Content.Text
+    doc.Close()
+    word.Quit()
+    return text
+from pptx import Presentation
+
+def extract_pptx(file_path):
+    prs = Presentation(file_path)
+    text = ''
+    for slide in prs.slides:
+        for shape in slide.shapes:
+            if hasattr(shape, "text"):
+                text += shape.text + '\n'
+    return text
+
+
+
+from aspose.slides import Presentation
+
+def extract_ppt(file_path):
+    """
+    使用 Aspose.Slides 提取 .ppt 文件的文本内容
+    """
+    prs = Presentation(file_path)  # 加载 .ppt 文件
+    text = ''  # 存储提取的文本
+
+    for slide in prs.slides:  # 遍历每张幻灯片
+        for shape in slide.shapes:  # 遍历每个形状
+            if shape.text_frame is not None:  # 检查形状是否有文本框
+                text += shape.text_frame.text + '\n'  # 提取文本并添加换行符
+
+    return text
+
+def extract_xlsx(file_path):
+    wb = openpyxl.load_workbook(file_path, data_only=True)
+    text = ''
+    for sheet in wb.sheetnames:
+        ws = wb[sheet]
+        for row in ws.iter_rows():
+            for cell in row:
+                text += str(cell.value) + ' '  # 以空格分隔每个单元格的内容
+        text += '\n'
+    return text
+# 提取.xls文件的内容（使用xlrd）
+import xlrd
+
+def extract_xls(file_path):
+    wb = xlrd.open_workbook(file_path)
+    text = ''
+    for sheet in wb.sheets():
+        for row in range(sheet.nrows):
+            for col in range(sheet.ncols):
+                text += str(sheet.cell_value(row, col)) + ' '  # 以空格分隔每个单元格的内容
+        text += '\n'
+    return text
+
+# 抽取 TXT 文件中的文本
+def extract_txt(file_path):
+    with open(file_path, 'rb') as f:
+        temp_text = f.read()
+    encoding = chardet.detect(temp_text)['encoding']
+    if encoding is None or encoding.lower() in ['gbk', 'gb2312']:
+        encoding = 'gbk'
+    else:
+        encoding = 'utf-8'
+    return temp_text.decode(encoding, 'ignore')
+
+# 扫描文件夹并检查指定的关键字
+def traversal_folder(file_path, keywords, scan_type):
+    file_results = []  # 用于存储单个文件的扫描结果
+    file_stats = {
+        "total_keyword_hits": 0,
+        "keyword_hits": {key: 0 for key in keywords},
+        "total_id_count": 0,
+        "matched_ids": [],  # 使用列表记录身份证号
+        "total_phone_count": 0,
+        "matched_phones": [],  # 使用列表记录手机号
+    }
+
+    try:
+        # 根据文件类型提取内容
+        if file_path.endswith('.pdf'):
+            text = try_read_file(file_path, extract_pdf)
+        elif file_path.endswith('.docx'):
+            text = try_read_file(file_path, extract_docx)  # 使用新的 extract_docx
+        elif file_path.endswith('.pptx'):
+            text = try_read_file(file_path, extract_pptx)  # 使用新的 extract_pptx
+        elif file_path.endswith('.xlsx'):
+            text = try_read_file(file_path, extract_xlsx)  # 使用新的 extract_xlsx
+        elif file_path.endswith('.txt'):
+            text = try_read_file(file_path, extract_txt)
+        elif file_path.endswith('.doc'):
+            text = try_read_file(file_path, extract_doc)  # 使用新的 extract_doc
+        elif file_path.endswith('.ppt'):
+            text = try_read_file(file_path, extract_ppt)  # 使用新的 extract_ppt
+        elif file_path.endswith('.xls'):
+            text = try_read_file(file_path, extract_xls)  # 使用新的 extract_xls
+
+        else:
+            return file_results, file_stats  # 不支持的文件类型
+
+        # 扫描内容
+        if text:
+            if scan_type == 'keyword':
+                hit_keywords, total_hits = contains(text, keywords)
+                file_stats["total_keyword_hits"] += total_hits
+                for key, count in hit_keywords.items():
+                    file_stats["keyword_hits"][key] += count
+                if hit_keywords:
+                    hits_summary = "：".join([f"{k}命中{v}次" for k, v in hit_keywords.items()])
+                    file_results.append(f'×扫描{os.path.normpath(file_path)}{hits_summary}\n')
+                else:
+                    file_results.append(f'√通过扫描{os.path.normpath(file_path)}\n')
+
+            elif scan_type == 'id':
+                ids = idset(text)
+                id_count = len(ids)
+                file_stats["total_id_count"] += id_count
+                file_stats["matched_ids"].extend(ids)  # 将命中的身份证号追加到列表中
+                if id_count > 0:
+                    file_results.append(f'×扫描{os.path.normpath(file_path)}：命中{id_count}个身份证号 {"：".join(ids)}\n')
+                else:
+                    file_results.append(f'√通过扫描{os.path.normpath(file_path)}\n')
+
+            elif scan_type == 'phone':
+                phones = phoneset(text)
+                phone_count = len(phones)
+                file_stats["total_phone_count"] += phone_count
+                file_stats["matched_phones"].extend(phones)  # 将命中的手机号追加到列表中
+                if phone_count > 0:
+                    file_results.append(f'×扫描{os.path.normpath(file_path)}：命中{phone_count}个手机号{"：".join(phones)}\n')
+                else:
+                    file_results.append(f'√通过扫描{os.path.normpath(file_path)}\n')
+
+    except Exception as e:
+        print(f"处理文件 {os.path.normpath(file_path)} 时出错: {e}")
+
+    return file_results, file_stats
+# 选择文件夹
+def select_folder():
+    folder_selected = filedialog.askdirectory()
+    if folder_selected:
+        folder_path_entry.delete(0, tk.END)
+        folder_path_entry.insert(0, folder_selected)
+
+
+# 计算文件夹中的文件数量，用于设置进度条的最大值
+def count_files(folder_path):
+    file_count = 0
+    for _, _, files in os.walk(folder_path):
+        file_count += len(files)
+    return file_count
+
+
+# 启动扫描线程
+def start_scan_thread(scan_type):
+    folder_path = folder_path_entry.get()
+    if not folder_path:
+        messagebox.showerror("错误", "请输入文件夹路径")
+        return
+
+    file_count = count_files(folder_path)
+    if file_count == 0:
+        messagebox.showinfo("提示", "选择的文件夹没有可扫描的文件")
+        return
+
+    # 创建弹出窗口用于显示进度条
+    progress_window = tk.Toplevel(root)
+    progress_window.title("扫描进度")
+    progress_label = tk.Label(progress_window, text="正在扫描文件，请稍候...")
+    progress_label.pack(pady=10)
+    progress_var = tk.DoubleVar()
+    progress_bar = ttk.Progressbar(progress_window, orient="horizontal", length=300, mode="determinate",
+                                   variable=progress_var)
+    progress_bar.pack(pady=10)
+
+    result_filename = os.path.join(folder_path, f'result_{scan_type}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.txt')
+
+    # 启动扫描线程，确保 perform_scan 函数在新线程中执行
+    scan_thread = threading.Thread(target=perform_scan,
+                                   args=(scan_type, folder_path, result_filename, file_count, progress_var, progress_window))
+    scan_thread.daemon = True  # 设置为守护线程，以便主窗口关闭时自动结束
+    scan_thread.start()
+
+
+# 扫描文件夹函数，包含进度更新
+def scan_folder(scan_type):
+    folder_path = folder_path_entry.get()
+    if not folder_path:
+        messagebox.showerror("错误", "请输入文件夹路径")
+        return
+
+
+    # 获取用户输入的关键词
+    custom_keywords = re.split(r'[，,]', keyword_entry.get())
+    custom_keywords = [word.strip() for word in custom_keywords if word.strip()]
+    keywords_to_use = custom_keywords if custom_keywords else default_keywords
+
+    # 计算文件总数，作为进度条的范围
+    file_count = sum(len(files) for _, _, files in os.walk(folder_path))
+    if file_count == 0:
+        messagebox.showinfo("提示", "选择的文件夹没有可扫描的文件")
+        return
+
+    # 创建进度条窗口
+    progress_window = tk.Toplevel(root)
+    progress_window.title("扫描进度")
+
+    # 设置进度条窗口的大小
+    window_width = 300
+    window_height = 150
+
+    # 计算屏幕中心位置
+    screen_width = progress_window.winfo_screenwidth()
+    screen_height = progress_window.winfo_screenheight()
+    x_coordinate = int((screen_width / 2) - (window_width / 2))
+    y_coordinate = int((screen_height / 2) - (window_height / 2))
+
+    # 将窗口放置在中心位置
+    progress_window.geometry(f"{window_width}x{window_height}+{x_coordinate}+{y_coordinate}")
+
+    # 设置窗口的图标（假设图标文件是logo.png）
+    icon_path = resource_path("logo.png")
+    icon = PhotoImage(file=icon_path)  # 替换为你的图标路径
+    progress_window.iconphoto(True, icon)  # 设置窗口的图标
+
+    # 添加其他 UI 元素
+    progress_label = tk.Label(progress_window, text="正在扫描，请稍候...")
+    progress_label.pack(pady=10)
+    progress_var = tk.DoubleVar()
+    progress_bar = ttk.Progressbar(progress_window, orient="horizontal", length=250, mode="determinate",
+                                       variable=progress_var)
+    progress_bar.pack(pady=10)
+
+    result_filename = os.path.join(folder_path, f'result_{scan_type}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.txt')
+
+    # 启动扫描线程
+    scan_thread = threading.Thread(target=perform_scan, args=(scan_type, folder_path, result_filename, file_count, progress_var, progress_window))
+    scan_thread.daemon = True  # 将线程设置为守护线程
+    scan_thread.start()
+
+
+
+def perform_scan(scan_type, folder_path, result_filename, file_count, progress_var, progress_window):
+    try:
+        # 获取自定义关键词
+        custom_keywords = re.split(r'[；;]', keyword_entry.get())
+        custom_keywords = [word.strip() for word in custom_keywords if word.strip()]
+        keywords_to_use = custom_keywords if custom_keywords else default_keywords
+
+        scanned_files = 0
+        all_results = []  # 用于存储所有文件的扫描结果
+
+        # 初始化统计数据
+        stats = {
+            "total_keyword_hits": 0,
+            "keyword_hits": {key: 0 for key in keywords_to_use},
+            "total_id_count": 0,
+            "matched_ids": [],  # 使用列表记录身份证号
+            "total_phone_count": 0,
+            "matched_phones": [],  # 使用列表记录手机号
+        }
+
+        # 创建 result 文件夹（如果不存在）
+        current_dir = os.path.dirname(os.path.abspath(sys.executable))  # 获取 .exe 文件所在的目录
+        result_folder = os.path.join(current_dir, "result")  # 将 result 文件夹放在当前目录下
+        if not os.path.exists(result_folder):
+            os.makedirs(result_folder)  # 如果 result 文件夹不存在，则创建
+        # 定义 scan_type 的映射字典
+        scan_type_map = {
+            "id":"id",
+            "keyword": "sw",
+            "phone": "mp"
+        }
+
+        # 将 scan_type 替换为对应的新值
+        mapped_scan_type = scan_type_map.get(scan_type, scan_type)  # 如果找不到对应值，保持原值
+
+        # 拼接结果文件路径
+        result_filename = os.path.join(
+            result_folder,
+            f'result_{mapped_scan_type}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.txt'
+        )
+
+        # # 将结果文件保存在 result 文件夹中
+        # result_filename = os.path.join(result_folder,
+        #                                f'result_{scan_type}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.txt')
+        # # 遍历文件夹并扫描文件
+        for root_dir, _, files in os.walk(folder_path):
+            for file_name in files:
+                if not file_name.startswith('~$'):  # 跳过临时文件
+                    file_path = os.path.normpath(os.path.join(root_dir, file_name))  # 格式化为反斜杠路径
+                    try:
+                        # 调用 traversal_folder 扫描文件并获取结果
+                        results, file_stats = traversal_folder(file_path, keywords_to_use, scan_type)
+                        all_results.extend(results)  # 收集文件扫描的结果
+
+                        # 累加统计数据
+                        stats["total_keyword_hits"] += file_stats.get("total_keyword_hits", 0)
+                        for key, count in file_stats.get("keyword_hits", {}).items():
+                            stats["keyword_hits"][key] += count
+                        stats["total_id_count"] += file_stats.get("total_id_count", 0)
+
+                        # 使用 extend 并去重
+                        stats["matched_ids"].extend(file_stats.get("matched_ids", []))
+                        #stats["matched_ids"] = list(set(stats["matched_ids"]))  # 去重
+
+                        stats["total_phone_count"] += file_stats.get("total_phone_count", 0)
+                        stats["matched_phones"].extend(file_stats.get("matched_phones", []))
+                        #stats["matched_phones"] = list(set(stats["matched_phones"]))  # 去重
+
+                    except Exception as e:
+                        print(f"扫描文件 {file_path} 时发生错误: {e}")
+
+                    # 更新进度条
+                    scanned_files += 1
+                    progress_var.set((scanned_files / file_count) * 100)
+                    progress_window.update_idletasks()
+
+        # 将扫描结果写入文件
+        with open(result_filename, 'w', encoding='utf-8') as out:
+            out.write('#扫描开始===========================================================\n')
+            for line in all_results:
+                out.write(line)
+            # 写入统计结果
+            write_summary(out, scan_type, stats)
+            out.write('#扫描完毕===========================================================\n')
+
+
+
+    except Exception as e:
+        print(f"扫描过程中发生错误: {e}")
+
+    finally:
+        # 确保进度窗口总是被销毁
+        if progress_window:
+            progress_window.destroy()
+
+    # 构造统计结果的字符串
+    result_message = f"扫描结果已保存到: {result_filename}\n\n"
+
+    if scan_type == 'keyword':
+        result_message += f"总计命中{stats['total_keyword_hits']}个敏感文字\n"
+    elif scan_type == 'id':
+        result_message += f"总计命中{stats['total_id_count']}个身份证号\n"
+    elif scan_type == 'phone':
+        result_message += f"总计命中{stats['total_phone_count']}个手机号\n"
+
+    # 显示扫描结果
+    messagebox.showinfo("扫描结果", result_message)
+
+
+#最小化到托盘
+def minimize_to_tray(icon):
+    icon.run()
+
+# 设置托盘菜单
+def create_tray_icon():
+    tray_icon_path = resource_path("logo.png")
+    icon_image = Image.open(tray_icon_path)
+    menu = Menu(MenuItem("退出", exit_application))
+    icon = Icon("FileScanner", icon_image, menu=menu)
+    tray_thread = threading.Thread(target=icon.run)
+    tray_thread.daemon = True
+    tray_thread.start()
+
+# 退出应用
+def exit_application(icon, item):
+    icon.stop()
+    root.quit()
+
+# 定义窗口圆角函数
+def make_window_rounded(hwnd, width, height, radius):
+    #print(f"设置圆角: 窗口句柄={hwnd}, 宽度={width}, 高度={height}, 圆角半径={radius}")
+    region = ctypes.windll.gdi32.CreateRoundRectRgn(0, 0, width, height, radius, radius)
+    result = ctypes.windll.user32.SetWindowRgn(hwnd, region, True)
+    ctypes.windll.user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0040)  # 强制更新窗口
+    #print(f"圆角设置结果: {result}")
+
+# 创建主窗口
+root = tk.Tk()
+root.geometry("725x350")
+root.title("MCSS")
+root.overrideredirect(True)  # 隐藏默认标题栏
+root.configure(bg="white")
+
+
+# 获取窗口句柄
+hwnd = ctypes.windll.user32.FindWindowW(None, "MCSS")
+#print(f"窗口句柄: {hwnd}")
+if hwnd:
+    make_window_rounded(hwnd, 600, 300, 5)  # 设置窗口圆角（半径为 20）
+# 获取窗口的实际大小
+width = root.winfo_width()
+height = root.winfo_height()
+#print(f"窗口大小: 宽度={width}, 高度={height}")
+# 延迟执行，确保窗口完全初始化后获取句柄和大小
+def apply_rounded_corners():
+    global hwnd
+    hwnd = ctypes.windll.user32.FindWindowW(None, "MCSS")
+    #print(f"窗口句柄（延迟获取）: {hwnd}")
+    width = root.winfo_width()
+    height = root.winfo_height()
+    #print(f"窗口大小（延迟获取）: 宽度={width}, 高度={height}")
+    if hwnd:
+        make_window_rounded(hwnd, width, height, 10)
+root.after(10, apply_rounded_corners)
+
+
+
+# 设置任务栏图标（使用 .ico 文件）
+icon_path = resource_path("logo.ico")  # 必须是 .ico 文件
+try:
+    root.iconbitmap(icon_path)  # 设置任务栏图标
+except Exception as e:
+    print(f"图标加载失败: {e}")
+
+# 使用 Windows API 将窗口与任务栏绑定
+def force_taskbar_icon():
+    try:
+        root.update_idletasks()  # 确保 Tkinter 窗口完成初始化
+        hwnd = ctypes.windll.user32.FindWindowW(None, "MCSS")  # 通过窗口标题获取窗口句柄
+        if not hwnd:
+            hwnd = ctypes.windll.user32.GetForegroundWindow()  # 如果找不到句柄，尝试获取前台窗口
+
+        # 强制激活窗口
+        ctypes.windll.user32.ShowWindow(hwnd, 5)  # 显示窗口（SW_SHOW）
+        ctypes.windll.user32.SetForegroundWindow(hwnd)  # 激活窗口
+
+        # 绑定任务栏
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("myappid")  # 设置应用 ID
+        ctypes.windll.user32.SetWindowLongPtrW(hwnd, -20, ctypes.windll.user32.GetWindowLongPtrW(hwnd,-20) & ~0x00000080)  # 强制设置窗口样式
+    except Exception as e:
+        print(f"任务栏图标绑定失败: {e}")
+
+    # 在窗口完全初始化后调用强制绑定
+
+
+root.after(100, force_taskbar_icon)
+# 颜色配置
+TITLE_BG = "#4F94CD"  # 标题栏背景颜色
+TITLE_FG = "white"  # 标题文字颜色
+BUTTON_BG = "#FFFFFF"  # 按钮背景颜色
+BUTTON_HOVER = "#1E90FF"  # 按钮鼠标悬停背景颜色
+
+# 窗口拖动功能
+def start_move(event):
+    root.x = event.x
+    root.y = event.y
+
+def stop_move(event):
+    root.x = None
+    root.y = None
+
+def do_move(event):
+    x = (event.x_root - root.x)
+    y = (event.y_root - root.y)
+    root.geometry(f"+{x}+{y}")
+
+# 关闭窗口
+def close_window():
+    root.destroy()
+
+# 最小化窗口
+def minimize_window():
+    try:
+        # 获取当前窗口句柄
+        hwnd = ctypes.windll.user32.FindWindowW(None, "MCSS")  # 通过窗口标题获取句柄
+        if not hwnd:  # 如果句柄为空，获取当前前台窗口
+            hwnd = ctypes.windll.user32.GetForegroundWindow()
+
+        if hwnd:  # 确保句柄有效
+            ctypes.windll.user32.ShowWindow(hwnd, 6)  # 最小化窗口（SW_MINIMIZE）
+        else:
+            print("窗口句柄获取失败，无法最小化窗口。")
+    except Exception as e:
+        print(f"最小化窗口失败: {e}")
+
+# 自定义标题栏
+title_bar = tk.Frame(root, bg=TITLE_BG, relief="flat", bd=0, height=30)
+title_bar.pack(side="top", fill="x")
+
+# 添加窗口图标
+icon_path = resource_path("logo.png")  # 替换为你的图标路径
+icon_image = Image.open(icon_path).resize((30, 30))  # 调整图标大小
+icon = ImageTk.PhotoImage(icon_image)
+icon_label = tk.Label(title_bar, image=icon, bg=TITLE_BG)
+icon_label.pack(side="left", padx=10, pady=5)
+
+# 添加标题文字
+title_label = tk.Label(
+    title_bar, text="MCSS", bg=TITLE_BG, fg="black", font=("Times New Roman", 14, "bold")
+)
+title_label.pack(side="left", padx=0)
+
+
+
+# 关闭按钮
+close_button = tk.Button(
+    title_bar,
+    text="X",
+    bg=BUTTON_BG,
+    fg="#4F94CD",
+    relief="flat",
+    font=("Arial", 12, "bold"),
+    command=close_window,
+    width=2,  # 设置按钮宽度为 3
+)
+close_button.pack(side="right", padx=8, pady=2)
+# 最小化按钮
+minimize_button = tk.Button(
+    title_bar,
+    text="—",
+    bg=BUTTON_BG,
+    fg="#4F94CD",
+    relief="flat",
+    font=("Arial", 12, "bold"),
+    command=minimize_window,
+    width=2,  # 设置按钮宽度为 3
+)
+minimize_button.pack(side="right", padx=5, pady=2)
+
+# 按钮悬停效果
+def on_hover(button, color):
+    button.config(bg=color)
+
+def on_leave(button, color):
+    button.config(bg=color)
+#
+minimize_button.bind("<Enter>", lambda e: on_hover(minimize_button, BUTTON_HOVER))
+minimize_button.bind("<Leave>", lambda e: on_leave(minimize_button, BUTTON_BG))
+
+close_button.bind("<Enter>", lambda e: on_hover(close_button, "red"))
+close_button.bind("<Leave>", lambda e: on_leave(close_button, BUTTON_BG))
+
+# 添加鼠标拖动事件绑定
+title_bar.bind("<Button-1>", start_move)
+title_bar.bind("<ButtonRelease-1>", stop_move)
+title_bar.bind("<B1-Motion>", do_move)
+
+# 继续创建其他组件
+# 文件夹路径选择部分
+folder_frame = tk.Frame(root, bg="#FFFFFF")  # 设置背景颜色
+folder_frame.pack(pady=10, fill="x")  # 水平方向填充父组件
+
+folder_path_label = tk.Label(
+    folder_frame,
+    text="扫描目标",
+    bg="#FFFFFF",
+    fg="#4F94CD",
+    font=("SimHei", 12, "bold"),
+    anchor="w"  # 标签内容靠左对齐
+    # 设置字体样式
+)
+folder_path_label.grid(row=0, column=0, padx=(20, 10),sticky='w')
+
+# 创建一个 Frame 作为输入框的边框
+entry_frame = tk.Frame(folder_frame, bg="#4F94CD", highlightthickness=0)
+entry_frame.grid(row=0, column=1, padx=(3, 10), pady=5)
+
+# 在 Frame 内创建 Entry
+folder_path_entry = tk.Entry(
+    entry_frame,
+    width=60,
+    bg="#FFFFFF",  # 输入框背景为白色
+    fg="#4F94CD",  # 输入框字体为黑色
+    relief="flat",  # 移除 Entry 自带的边框
+    font=("Times New Roman", 12,"bold")
+)
+folder_path_entry.pack(padx=1, pady=1)  # 设置内边距，让边框可见
+
+# 创建渐变按钮函数
+def create_gradient_button(parent, text, command, width=150, height=50, border_color="#4F94CD", border_width=2):
+    # 创建 Canvas 作为按钮容器
+    canvas = tk.Canvas(
+        parent,
+        width=width + 2 * border_width,
+        height=height + 2 * border_width,
+        bd=0,
+        highlightthickness=0,
+        relief="flat"
+    )
+    canvas.grid_propagate(False)
+
+    # 自定义渐变颜色（顶部浅蓝 -> 中间深蓝 -> 底部浅蓝）
+    top_color = (210, 235, 255)   # 顶部颜色 (浅蓝色 RGB)
+    middle_color = (72, 135, 188)  # 中间颜色 (深蓝 RGB)
+
+    diffusion_ratio = 1
+    diffusion_height = int(height * diffusion_ratio / 2)
+
+    # 绘制渐变背景
+    for i in range(height):
+        if i < diffusion_height:
+            r = int(top_color[0] + (middle_color[0] - top_color[0]) * (i / diffusion_height))
+            g = int(top_color[1] + (middle_color[1] - top_color[1]) * (i / diffusion_height))
+            b = int(top_color[2] + (middle_color[2] - top_color[2]) * (i / diffusion_height))
+        elif i > height - diffusion_height:
+            r = int(middle_color[0] + (top_color[0] - middle_color[0]) * ((i - (height - diffusion_height)) / diffusion_height))
+            g = int(middle_color[1] + (top_color[1] - middle_color[1]) * ((i - (height - diffusion_height)) / diffusion_height))
+            b = int(middle_color[2] + (top_color[2] - middle_color[2]) * ((i - (height - diffusion_height)) / diffusion_height))
+        else:
+            r, g, b = middle_color
+
+        color = f"#{r:02x}{g:02x}{b:02x}"
+        canvas.create_line(
+            border_width, i + border_width,
+            width + border_width, i + border_width,
+            fill=color
+        )
+
+    # 绘制按钮边框
+    canvas.create_rectangle(
+        0, 0, width + 2 * border_width, height + 2 * border_width,
+        outline=border_color,
+        width=border_width
+    )
+
+    # 绘制按钮文字
+    canvas.create_text(
+        (width + 2 * border_width) / 2, (height + 2 * border_width) / 2,  # 文字居中
+        text=text,
+        fill="white",
+        font=("SimHei", 12, "bold")
+    )
+
+    # 绑定点击事件
+    def on_click(event):
+        command()
+
+    canvas.bind("<Button-1>", on_click)
+
+    return canvas
+
+# 创建渐变按钮
+gradient_button = create_gradient_button(
+    folder_frame,
+    text="根文件夹选择",
+    command=select_folder,
+    width=100,
+    height=22
+)
+gradient_button.grid(row=0, column=2, padx=(1, 10), pady=5)
+
+# 创建渐变分割线函数
+def create_gradient_separator(parent, width, height, start_color, end_color):
+    """
+    创建一个渐变分割线
+    :param parent: 父窗口
+    :param width: 分割线宽度
+    :param height: 分割线高度
+    :param start_color: 渐变起始颜色 (RGB 元组)
+    :param end_color: 渐变结束颜色 (RGB 元组)
+    :return: Canvas 对象
+    """
+    canvas = tk.Canvas(parent, width=width, height=height, bd=0, highlightthickness=0, relief="flat")
+
+    # 计算颜色渐变
+    for i in range(height):
+        r = int(start_color[0] + (end_color[0] - start_color[0]) * (i / height))
+        g = int(start_color[1] + (end_color[1] - start_color[1]) * (i / height))
+        b = int(start_color[2] + (end_color[2] - start_color[2]) * (i / height))
+        color = f"#{r:02x}{g:02x}{b:02x}"  # 转换为 Hex 格式
+        canvas.create_line(0, i, width, i, fill=color)
+
+    return canvas
+
+# 使用渐变分割线
+separator = create_gradient_separator(root, width=720, height=13, start_color=(210, 235, 255), end_color=(72, 135, 188))
+separator.pack(fill="x", pady=(5, 5))
+
+# 创建敏感文字部分
+button_frame = tk.Frame(root, bg="white")  # 设置背景为白色
+button_frame.pack(pady=10, fill="x")  # 填满横向
+
+# 创建标签 "敏感文字"
+keyword_label = tk.Label(
+    button_frame,
+    text="敏感文字\n(分号间隔)",
+    bg="#FFFFFF",
+    fg="#4F94CD",
+    font=("SimHei", 12, "bold"),
+)
+keyword_label.grid(row=0, column=0, padx=(10, 3.5), pady=5, sticky="w")
+
+# 创建一个 Frame 作为输入框的边框
+keyword_entry_frame = tk.Frame(button_frame, bg="#4F94CD", highlightthickness=0)
+keyword_entry_frame.grid(row=0, column=1, padx=(0, 10), pady=5)
+
+# 在 Frame 内创建 Entry
+keyword_entry = tk.Entry(
+    keyword_entry_frame,
+    width=60,
+    bg="#FFFFFF",  # 输入框背景为白色
+    fg="#4F94CD",  # 输入框字体颜色
+    relief="flat",  # 移除 Entry 自带的边框
+    font=("Times New Roman", 12, "bold"),
+)
+keyword_entry.pack(padx=1, pady=1)  # 设置内边距，让边框可见
+
+
+# 添加扫描按钮
+# 敏感文字按钮
+scan_button_keywords =  create_gradient_button(
+    button_frame,
+    text="敏感文字扫描",
+    command=lambda: scan_folder('keyword'),
+    width=100,
+    height=22
+
+)
+scan_button_keywords.grid(row=0, column=2, padx=(0, 25), pady=5)
+#手机号扫描按钮
+scan_button_keywords =  create_gradient_button(
+    button_frame,
+    text="手机号码扫描",
+    command=lambda: scan_folder('phone'),
+    width=100,
+    height=22
+
+)
+scan_button_keywords.grid(row=1, column=2, padx=(0, 20), pady=0)
+#身份证号扫描按钮
+scan_button_keywords =  create_gradient_button(
+    button_frame,
+    text="身份证号扫描",
+    command=lambda: scan_folder('id'),
+    width=100,
+    height=22
+
+)
+scan_button_keywords.grid(row=2, column=2, padx=(0, 20), pady=5)
+
+
+
+
+# 创建一个子容器用于放置图标和文字，使用 pack 布局
+# left_bottom_frame = tk.Frame(button_frame, bg="red")
+# left_bottom_frame.grid(row=1, column=0, padx=(5, 0), pady=19)  # 放置在左下角
+
+# 尝试加载图标
+footer_icon_path =resource_path( "logo.png")  # 替换为实际的图标路径
+try:
+     footer_icon_image = Image.open(footer_icon_path).resize((70, 70))  # 调整图标大小
+     footer_icon = ImageTk.PhotoImage(footer_icon_image)
+     icon_label = tk.Label(button_frame, image=footer_icon, bg="white")
+     icon_label.image = footer_icon  # 保持引用，防止被垃圾回收
+     icon_label.grid(row=1, column=0, padx=(20, 0), pady=20, sticky="w")
+except Exception as e:
+     print(f"加载图标失败: {e}")
+     # 如果图标加载失败，显示占位文字
+     icon_label = tk.Label(button_frame, text="图标加载失败", bg=None, fg="red")
+     icon_label.grid(side="left", padx=5)
+
+# 创建 Text 控件
+
+
+footer_text = tk.Text(
+    button_frame,
+    height=4,  # 设置行数
+    width=62,  # 设置列数
+    wrap=tk.WORD,  # 自动换行
+    bg=None,  # 背景透明
+    fg="black",  # 文字颜色
+    font=("SimHei", 12),  # 默认字体
+    bd=0,  # 无边框
+    highlightthickness=0,  # 去掉高亮边框
+    relief="flat"  # 去掉控件的边框
+)
+footer_text.grid(row=1, column=1, padx=(0, 0), pady=10)
+
+# 插入第1行文本，并设置样式
+footer_text.insert(tk.END, "多功能内容安全扫描器\n")
+footer_text.tag_add("line1", "1.0", "1.end")
+footer_text.tag_configure("line1", font=("SimHei", 25, "bold"), foreground="#4F94CD")
+
+# 插入第2行文本，并设置样式
+footer_text.insert(tk.END, "Multifunctional Content Security Scanner")
+footer_text.tag_add("line2", "2.0", "2.end")
+footer_text.tag_configure("line2", font=("Times New Roman", 20), foreground="black")
+
+# 禁止编辑 Text 控件
+footer_text.config(state=tk.DISABLED)
+
+# 设置底部左边框
+left_border = tk.Frame(root, bg="#4F94CD", width=8, height=400)  # 设置颜色、宽度和高度
+left_border.place(x=0, y=0, anchor="nw")  # 左边框放置在窗口左上角
+
+# 设置底部右边框
+right_border = tk.Frame(root, bg="#4F94CD", width=8, height=400)  # 设置颜色、宽度和高度
+right_border.place(x=725, y=0, anchor="ne")  # 右边框放置在窗口右上角
+
+# 设置底部边框
+bottom_border = tk.Frame(root, bg="#4F94CD", width=720, height=8)  # 设置颜色、宽度和高度
+bottom_border.place(x=0, y=350, anchor="sw")  # 底部边框放置在窗口底部
+
+# scan_button_id = tk.Button(button_frame, text="身份证号扫描", command=lambda: scan_folder('id'), width=button_width)
+# scan_button_id.grid(row=0, column=1, padx=5)
+#
+# scan_button_phone = tk.Button(button_frame, text="手机号码扫描", command=lambda: scan_folder('phone'), width=button_width)
+# scan_button_phone.grid(row=0, column=2, padx=5)
+
+
+
+
+
+def is_valid_usb_connected(target_id):
+    """
+    检查目标 U 盘是否插入，匹配 PNPDeviceID。
+    """
+    c = wmi.WMI()
+    for disk in c.Win32_DiskDrive():
+        if "Removable" in disk.MediaType:
+            if target_id in disk.PNPDeviceID:
+                return True
+    return False
+
+def validate_usb():
+    """
+    验证目标 U 盘是否插入。
+    如果未检测到授权 U 盘，弹出提示框并返回 False。
+    如果检测到授权 U 盘，返回 True。
+    """
+    if not is_valid_usb_connected(target_usb_id):
+        #messagebox.showerror("验证失败", "未检测到授权 U 盘！请插入授权 U 盘后重试。")
+        return False  # 验证失败
+    return True  # 验证成功
+
+# 在程序启动时验证 U 盘
+# validate_usb()
+
+# 最小化到托盘
+create_tray_icon()
+# 确保窗口显示
+root.deiconify()
+# 启动事件循环
+root.mainloop()
